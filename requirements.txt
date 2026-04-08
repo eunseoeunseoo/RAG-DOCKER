@@ -1,6 +1,12 @@
 llama-index
+llama-index-readers-file
 llama-index-readers-wikipedia
 llama-index-embeddings-huggingface
-wikipedia
 sentence-transformers
 torch
+wikipedia
+pandas
+openpyxl
+python-docx
+pypdf
+pillow
