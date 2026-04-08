@@ -10,3 +10,5 @@ openpyxl
 python-docx
 pypdf
 pillow
+pytesseract
+tabulate
