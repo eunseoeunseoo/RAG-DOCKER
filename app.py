@@ -2,11 +2,12 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+import gradio as gr
 
 from llama_index.readers.wikipedia import WikipediaReader
-from llama_index.core import SimpleDirectoryReader, SummaryIndex, VectorStoreIndex, Settings, Document
+from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Settings, Document
 from llama_index.core.node_parser import SimpleNodeParser
-from llama_index.core.llms.mock import MockLLM
+from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.readers.base import BaseReader
 
@@ -17,68 +18,32 @@ from llama_index.readers.file import (
     FlatReader,
 )
 
-# Logging 활성화
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
-# 0. 설정: 로컬 임베딩 + Mock LLM
+# ── 설정 ─────────────────────────────────────────────────────────────────────
+import os
 Settings.embed_model = HuggingFaceEmbedding(model_name="all-MiniLM-L6-v2")
-Settings.llm = MockLLM()
+Settings.llm = GoogleGenAI(
+    model="gemini-2.0-flash",
+    api_key=os.environ.get("GEMINI_API_KEY", ""),
+)
 
-print("=== Block 1: Document 로드 ===")
-loader = WikipediaReader()
-
-documents = loader.load_data(pages=["Python (programming language)"])
-
-print(f"len(documents) = {len(documents)}")
-print("documents[0].metadata =")
-print(documents[0].metadata)
-print("documents[0].text[:300] =")
-print(documents[0].text[:300])
-
-print("\n=== Block 2: Node 분할 ===")
-# chunk_size 축소 + overlap 추가로 경계 문맥 보존
 parser = SimpleNodeParser.from_defaults(chunk_size=256, chunk_overlap=50)
-nodes = parser.get_nodes_from_documents(documents)
-
-print(f"len(nodes) = {len(nodes)}")
-print("nodes[0].text[:200] =")
-print(nodes[0].text[:200])
-print("nodes[0].metadata =")
-print(nodes[0].metadata)
-
-print("\n=== Block 3: VectorStoreIndex 구축 ===")
-# SummaryIndex → VectorStoreIndex: 임베딩 유사도 기반 검색으로 정확도 향상
-index = VectorStoreIndex(nodes)
-print("VectorStoreIndex 생성 완료")
-
-print("\n=== Block 4: QueryEngine 실행 ===")
-query_engine = index.as_query_engine()
-response = query_engine.query("What is Python used for?")
-
-print("질문: What is Python used for?")
-print("응답:")
-print(response)
 
 
-# ── 커스텀 Reader 정의 ────────────────────────────────────────────────────────
+# ── 커스텀 Reader ─────────────────────────────────────────────────────────────
 
 class XlsxReader(BaseReader):
-    """pandas로 xlsx를 읽어 Markdown 테이블로 변환 (행·열 구조 보존)."""
-
     def load_data(self, file, extra_info=None):
         file_path = str(file)
         xls = pd.ExcelFile(file_path, engine="openpyxl")
         documents = []
-
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl")
-            # Markdown 테이블로 변환 — 헤더·행 관계를 텍스트에 보존
             try:
                 text = df.to_markdown(index=False)
             except ImportError:
-                # tabulate 없을 경우 fallback
                 text = df.to_string(index=False)
-
             metadata = {
                 "file_name": Path(file_path).name,
                 "file_path": file_path,
@@ -87,26 +52,19 @@ class XlsxReader(BaseReader):
             }
             if extra_info:
                 metadata.update(extra_info)
-
             documents.append(Document(text=text, metadata=metadata))
-
         return documents
 
 
 class OCRImageReader(BaseReader):
-    """pytesseract OCR로 PNG 이미지 내 텍스트를 추출."""
-
     def load_data(self, file, extra_info=None):
         try:
             import pytesseract
             from PIL import Image
-
             img = Image.open(str(file))
-            # 한국어(kor) + 영어(eng) 동시 인식
             text = pytesseract.image_to_string(img, lang="kor+eng")
         except Exception as e:
             text = f"[OCR 실패: {e}]"
-
         metadata = {
             "file_name": Path(str(file)).name,
             "file_path": str(file),
@@ -114,70 +72,135 @@ class OCRImageReader(BaseReader):
         }
         if extra_info:
             metadata.update(extra_info)
-
         return [Document(text=text, metadata=metadata)]
 
 
-# ── 확장자별 Reader 매핑 ──────────────────────────────────────────────────────
 file_extractor = {
     ".txt":  FlatReader(),
     ".pdf":  PDFReader(),
     ".docx": DocxReader(),
     ".xlsx": XlsxReader(),
     ".hwp":  HWPReader(),
-    ".png":  OCRImageReader(),   # OCR 기반으로 교체
+    ".png":  OCRImageReader(),
 }
 
-# ── Block 7: 다양한 문서 포맷 로드 ───────────────────────────────────────────
-print("\n=== Block 7: 다양한 문서 포맷 로드 ===")
+# ── 인덱스 초기화 (앱 시작 시 1회) ──────────────────────────────────────────
 
-reader = SimpleDirectoryReader(
+print(">>> 인덱스 초기화 중... (최초 1회, 잠시 기다려주세요)")
+
+# Wikipedia 인덱스
+wiki_docs = WikipediaReader().load_data(pages=["Python (programming language)"])
+wiki_nodes = parser.get_nodes_from_documents(wiki_docs)
+wiki_index = VectorStoreIndex(wiki_nodes)
+wiki_engine = wiki_index.as_query_engine(similarity_top_k=5)
+
+# 로컬 파일 인덱스
+local_reader = SimpleDirectoryReader(
     input_dir="data",
     file_extractor=file_extractor,
     required_exts=[".txt", ".pdf", ".docx", ".xlsx", ".hwp", ".png"],
 )
+local_docs = local_reader.load_data()
+local_nodes = parser.get_nodes_from_documents(local_docs)
+local_index = VectorStoreIndex(local_nodes)
+local_engine = local_index.as_query_engine(similarity_top_k=5)
 
-documents = reader.load_data()
+# 전체 통합 인덱스
+all_nodes = wiki_nodes + local_nodes
+all_index = VectorStoreIndex(all_nodes)
+all_engine = all_index.as_query_engine(similarity_top_k=5)
 
-print(f"\n총 Document 개수: {len(documents)}")
+print(f">>> 초기화 완료! (Wikipedia {len(wiki_nodes)}개 + 로컬 {len(local_nodes)}개 노드)")
 
-print("\n=== Document별 metadata & 내용 일부 ===")
-for i, doc in enumerate(documents):
-    print(f"\n[Document {i}]")
-    print("metadata =", doc.metadata)
-    print("text[:200] =", doc.text[:200])
+# 파일 목록 텍스트
+file_list = "\n".join(
+    sorted(set(doc.metadata.get("file_name", "unknown") for doc in local_docs))
+)
 
-# ── Node 분할 (chunk_size·overlap 적용) ──────────────────────────────────────
-print("\n=== Node 분할 ===")
+# ── Gradio UI ─────────────────────────────────────────────────────────────────
 
-parser = SimpleNodeParser.from_defaults(chunk_size=256, chunk_overlap=50)
-nodes = parser.get_nodes_from_documents(documents)
+def query_rag(question: str, source: str) -> tuple[str, str]:
+    if not question.strip():
+        return "", "질문을 입력해주세요."
 
-print(f"총 Node 개수: {len(nodes)}")
-if nodes:
-    print("nodes[0].metadata =", nodes[0].metadata)
-    print("nodes[0].text[:200] =", nodes[0].text[:200])
+    if source == "로컬 파일 (data/)":
+        engine = local_engine
+    elif source == "Wikipedia (Python)":
+        engine = wiki_engine
+    else:
+        engine = all_engine
 
-# ── VectorStoreIndex 생성 ─────────────────────────────────────────────────────
-print("\n=== VectorStoreIndex 생성 ===")
+    response = engine.query(question)
 
-index = VectorStoreIndex(nodes)
-print("VectorStoreIndex 생성 완료")
+    # 검색된 소스 노드 정리
+    sources = []
+    if hasattr(response, "source_nodes"):
+        for node in response.source_nodes:
+            fname = node.metadata.get("file_name", node.metadata.get("filename", "Wikipedia"))
+            score = f"{node.score:.3f}" if node.score is not None else "-"
+            preview = node.text[:120].replace("\n", " ")
+            sources.append(f"**[{fname}]** (유사도: {score})\n> {preview}…")
+    sources_text = "\n\n".join(sources) if sources else "소스 정보 없음"
 
-# ── QueryEngine 실행 ──────────────────────────────────────────────────────────
-print("\n=== QueryEngine 실행 ===")
+    return str(response), sources_text
 
-query_engine = index.as_query_engine(similarity_top_k=5)
 
-test_queries = [
-    "각 파일의 내용을 간단히 요약해줘",
-    "Policy.pdf에서 언급된 주요 정책 내용은?",
-    "SRS.docx의 요구사항 목록을 알려줘",
-    "이미지에 포함된 텍스트는 무엇인가?",
-]
+with gr.Blocks(title="RAG 파이프라인", theme=gr.themes.Soft()) as demo:
+    gr.Markdown(
+        """
+        # RAG 파이프라인 데모
+        문서에 질문하면 관련 내용을 찾아 답변합니다.
+        """
+    )
 
-for q in test_queries:
-    print(f"\n질문: {q}")
-    response = query_engine.query(q)
-    print("응답:")
-    print(response)
+    with gr.Row():
+        with gr.Column(scale=1):
+            gr.Markdown(f"### 로드된 파일\n```\n{file_list}\n```")
+            gr.Markdown(f"**Wikipedia**: Python (programming language)")
+            gr.Markdown(
+                f"**노드 수**: Wikipedia {len(wiki_nodes)}개 / 로컬 {len(local_nodes)}개"
+            )
+
+        with gr.Column(scale=3):
+            source_radio = gr.Radio(
+                choices=["전체 통합", "로컬 파일 (data/)", "Wikipedia (Python)"],
+                value="전체 통합",
+                label="검색 대상",
+            )
+            question_box = gr.Textbox(
+                placeholder="예: Policy.pdf에서 연구비 지침의 목적은 무엇인가요?",
+                label="질문 입력",
+                lines=2,
+            )
+            submit_btn = gr.Button("검색", variant="primary")
+
+            gr.Markdown("### 답변")
+            answer_box = gr.Textbox(label="", lines=6, interactive=False)
+
+            gr.Markdown("### 참조 소스 (검색된 청크)")
+            sources_box = gr.Markdown()
+
+    # 예시 질문
+    gr.Examples(
+        examples=[
+            ["Policy.pdf에서 연구비 지침의 목적은 무엇인가?", "로컬 파일 (data/)"],
+            ["SRS.docx에서 소프트웨어 요구사항의 적용 범위는?", "로컬 파일 (data/)"],
+            ["이미지에 포함된 텍스트는 무엇인가?", "로컬 파일 (data/)"],
+            ["What is Python used for?", "Wikipedia (Python)"],
+            ["Python의 주요 특징은 무엇인가?", "전체 통합"],
+        ],
+        inputs=[question_box, source_radio],
+    )
+
+    submit_btn.click(
+        fn=query_rag,
+        inputs=[question_box, source_radio],
+        outputs=[answer_box, sources_box],
+    )
+    question_box.submit(
+        fn=query_rag,
+        inputs=[question_box, source_radio],
+        outputs=[answer_box, sources_box],
+    )
+
+demo.launch(server_name="0.0.0.0", server_port=7860)
