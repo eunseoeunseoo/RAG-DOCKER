@@ -8,7 +8,9 @@ wikipedia
 pandas
 openpyxl
 python-docx
+docx2txt
 pypdf
 pillow
 pytesseract
 tabulate
+olefile
