@@ -92,7 +92,7 @@ print(">>> 인덱스 초기화 중... (최초 1회, 잠시 기다려주세요)")
 wiki_docs = WikipediaReader().load_data(pages=["Python (programming language)"])
 wiki_nodes = parser.get_nodes_from_documents(wiki_docs)
 wiki_index = VectorStoreIndex(wiki_nodes)
-wiki_engine = wiki_index.as_query_engine(similarity_top_k=5)
+wiki_engine = wiki_index.as_query_engine(similarity_top_k=3)
 
 # 로컬 파일 인덱스
 local_reader = SimpleDirectoryReader(
@@ -103,12 +103,12 @@ local_reader = SimpleDirectoryReader(
 local_docs = local_reader.load_data()
 local_nodes = parser.get_nodes_from_documents(local_docs)
 local_index = VectorStoreIndex(local_nodes)
-local_engine = local_index.as_query_engine(similarity_top_k=5)
+local_engine = local_index.as_query_engine(similarity_top_k=3)
 
 # 전체 통합 인덱스
 all_nodes = wiki_nodes + local_nodes
 all_index = VectorStoreIndex(all_nodes)
-all_engine = all_index.as_query_engine(similarity_top_k=5)
+all_engine = all_index.as_query_engine(similarity_top_k=3)
 
 print(f">>> 초기화 완료! (Wikipedia {len(wiki_nodes)}개 + 로컬 {len(local_nodes)}개 노드)")
 
