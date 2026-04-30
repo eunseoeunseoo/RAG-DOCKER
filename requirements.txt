@@ -17,3 +17,6 @@ olefile
 gradio
 llama-index-llms-google-genai
 google-generativeai
+# Mission 1 — Streamable HTTP MCP
+fastmcp
+mcp[cli]
