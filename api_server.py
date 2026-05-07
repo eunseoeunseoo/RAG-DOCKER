@@ -1,15 +1,141 @@
 """
-api_server.py - Mock RAG Retrieval API (테스트용)
+api_server.py - RAG Retrieval API (Mission 1)
 
 GET  /health   → {"status": "ok", "ready": true}
-POST /retrieve → 하드코딩된 contexts 반환 (실제 검색 없음)
+POST /retrieve → {"contexts": [{"text": "...", "source": "...", "score": 0.82}]}
 """
 
-from fastapi import FastAPI
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import pandas as pd
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from llama_index.core import (
+    Document,
+    Settings,
+    SimpleDirectoryReader,
+    StorageContext,
+    VectorStoreIndex,
+    load_index_from_storage,
+)
+from llama_index.core.node_parser import SimpleNodeParser
+from llama_index.core.readers.base import BaseReader
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.readers.file import DocxReader, FlatReader, HWPReader, PDFReader
+from llama_index.readers.wikipedia import WikipediaReader
 from pydantic import BaseModel
 
-app = FastAPI(title="Mock RAG Retrieval API")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+STORAGE_DIR = "./storage"
+INDEX: VectorStoreIndex | None = None
+
+
+class XlsxReader(BaseReader):
+    def load_data(self, file, extra_info=None):
+        file_path = str(file)
+        xls = pd.ExcelFile(file_path, engine="openpyxl")
+        documents = []
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl")
+            try:
+                text = df.to_markdown(index=False)
+            except ImportError:
+                text = df.to_string(index=False)
+            metadata = {
+                "file_name": Path(file_path).name,
+                "file_path": file_path,
+                "file_type": ".xlsx",
+                "sheet_name": sheet_name,
+            }
+            if extra_info:
+                metadata.update(extra_info)
+            documents.append(Document(text=text, metadata=metadata))
+        return documents
+
+
+class OCRImageReader(BaseReader):
+    def load_data(self, file, extra_info=None):
+        try:
+            import pytesseract
+            from PIL import Image
+            image = Image.open(str(file))
+            text = pytesseract.image_to_string(image, lang="kor+eng")
+        except Exception as exc:
+            text = f"[OCR failed: {exc}]"
+        metadata = {
+            "file_name": Path(str(file)).name,
+            "file_path": str(file),
+            "file_type": ".png",
+        }
+        if extra_info:
+            metadata.update(extra_info)
+        return [Document(text=text, metadata=metadata)]
+
+
+def build_or_load_index() -> VectorStoreIndex:
+    Settings.embed_model = HuggingFaceEmbedding(model_name="all-MiniLM-L6-v2")
+    Settings.llm = None
+
+    if Path(STORAGE_DIR).exists() and any(Path(STORAGE_DIR).iterdir()):
+        logger.info("Loading index from %s ...", STORAGE_DIR)
+        storage_context = StorageContext.from_defaults(persist_dir=STORAGE_DIR)
+        index = load_index_from_storage(storage_context)
+        logger.info("Index loaded from storage.")
+        return index
+
+    logger.info("Building VectorStoreIndex from scratch ...")
+    parser = SimpleNodeParser.from_defaults(chunk_size=256, chunk_overlap=50)
+
+    import wikipedia as _wp
+    _wp.set_user_agent("api_server/1.0 (RAG study project)")
+    wiki_docs = []
+    for attempt in range(3):
+        try:
+            wiki_docs = WikipediaReader().load_data(pages=["Python (programming language)"])
+            break
+        except Exception as exc:
+            logger.warning("Wikipedia load attempt %d failed: %s", attempt + 1, exc)
+    wiki_nodes = parser.get_nodes_from_documents(wiki_docs)
+    logger.info("Wikipedia: %d nodes", len(wiki_nodes))
+
+    file_extractor = {
+        ".txt": FlatReader(),
+        ".pdf": PDFReader(),
+        ".docx": DocxReader(),
+        ".xlsx": XlsxReader(),
+        ".hwp": HWPReader(),
+        ".png": OCRImageReader(),
+    }
+    local_reader = SimpleDirectoryReader(
+        input_dir="data",
+        file_extractor=file_extractor,
+        required_exts=[".txt", ".pdf", ".docx", ".xlsx", ".hwp", ".png"],
+    )
+    local_docs = local_reader.load_data()
+    local_nodes = parser.get_nodes_from_documents(local_docs)
+    logger.info("Local data/: %d nodes", len(local_nodes))
+
+    all_nodes = wiki_nodes + local_nodes
+    index = VectorStoreIndex(all_nodes)
+    index.storage_context.persist(STORAGE_DIR)
+    logger.info("Index persisted to %s/ (%d nodes total)", STORAGE_DIR, len(all_nodes))
+    return index
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global INDEX
+    logger.info("Initializing RAG index ...")
+    INDEX = build_or_load_index()
+    logger.info("RAG index ready.")
+    yield
+
+
+app = FastAPI(title="RAG Retrieval API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,38 +144,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MOCK_CONTEXTS = [
-    {
-        "text": "제 2 조(적용범위) 연구비 지원기관의 별도 기준이나 지침이 있는 경우를 제외하고는 연구비 관리 업무처리에 관한 사항은 이 지침을 따른다.",
-        "source": "Policy.pdf",
-        "score": 0.85,
-    },
-    {
-        "text": "제 3 조(역할 및 절차) 산학협력단은 연구과제 안내에서부터 협약, 연구비 청구 및 사후관리 등 연구자가 원활하게 연구를 수행할 수 있도록 지원한다.",
-        "source": "Policy.pdf",
-        "score": 0.78,
-    },
-    {
-        "text": "비기능 요구사항: 시스템은 99.9% 이상의 가용성을 보장해야 하며, 응답 시간은 2초 이내여야 한다.",
-        "source": "SRS.docx",
-        "score": 0.71,
-    },
-    {
-        "text": "Python is a high-level, general-purpose programming language. Its design philosophy emphasizes code readability with the use of significant indentation.",
-        "source": "Wikipedia",
-        "score": 0.65,
-    },
-    {
-        "text": "연구책임자는 연구과제의 각종 보고와 연구비 집행 및 정산에 관한 사항에 대해 주관하여 수행한다.",
-        "source": "Policy.pdf",
-        "score": 0.61,
-    },
-]
-
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ready": True}
+    return {"status": "ok", "ready": INDEX is not None}
 
 
 class RetrieveRequest(BaseModel):
@@ -59,7 +157,24 @@ class RetrieveRequest(BaseModel):
 
 @app.post("/retrieve")
 def retrieve(req: RetrieveRequest):
-    return {"contexts": MOCK_CONTEXTS[: req.top_k]}
+    if INDEX is None:
+        raise HTTPException(status_code=503, detail="Index not ready")
+
+    retriever = INDEX.as_retriever(similarity_top_k=req.top_k)
+    nodes = retriever.retrieve(req.question)
+
+    contexts = []
+    for node in nodes:
+        meta = node.metadata or {}
+        source = meta.get("file_name", meta.get("filename", "Wikipedia"))
+        score = getattr(node, "score", None)
+        text = (node.text or "")[:2000]
+        entry = {"text": text, "source": source}
+        if isinstance(score, (int, float)):
+            entry["score"] = round(score, 4)
+        contexts.append(entry)
+
+    return {"contexts": contexts}
 
 
 if __name__ == "__main__":
