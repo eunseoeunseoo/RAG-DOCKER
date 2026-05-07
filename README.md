@@ -87,6 +87,172 @@ docker run -d -p 7860:7860 -e GEMINI_API_KEY="your_api_key" rag-docker
 
 ---
 
+# Mission 3 — RAG Retrieval API 공개 + 리더보드 Baseline
+
+## 1. 구현 목표
+
+외부 평가 서버가 직접 호출할 수 있는 RAG Retrieval HTTP API를 구현하고, Cloudflare Quick Tunnel을 통해 public HTTPS URL로 공개했습니다. 평가 기준은 LLM 생성 답변이 아니라 **retrieval 결과(contexts)** 입니다.
+
+## 2. 시스템 구성
+
+```
+Docker container (RAG API)
+  api_server.py — FastAPI, port 8000 (0.0.0.0 bind)
+        |
+        | docker compose ports: 8000:8000
+        v
+Host PC — http://127.0.0.1:8000
+        |
+        | cloudflared.exe tunnel
+        v
+https://isle-composite-jobs-substance.trycloudflare.com  ← 평가 서버가 호출
+```
+
+| 항목 | 내용 |
+|------|------|
+| API 서버 파일 | `api_server.py` (FastAPI + uvicorn) |
+| 인덱스 소스 | `storage/` 디렉터리 (없으면 Wikipedia + `data/` 로 자동 빌딩) |
+| 임베딩 모델 | `HuggingFaceEmbedding` (`all-MiniLM-L6-v2`) |
+| chunk_size / overlap | 256 / 50 |
+| 배포 방법 | `docker compose up -d` |
+| 외부 공개 | Cloudflare Quick Tunnel |
+| 제출 파일 | `rag_endpoint.json` |
+
+## 3. API 엔드포인트 명세
+
+### GET /health
+
+서버와 인덱스가 평가 가능한 상태인지 확인합니다.
+
+응답:
+```json
+{"status": "ok", "ready": true}
+```
+
+### POST /retrieve
+
+질문을 받아 관련 context를 반환합니다.
+
+요청:
+```json
+{"question": "출장비 초과 시 어떤 승인이 필요한가?", "top_k": 5}
+```
+
+응답:
+```json
+{
+  "contexts": [
+    {
+      "text": "제 2 조(적용범위)  연구비  지원기관...",
+      "source": "Policy.pdf",
+      "score": 0.5372
+    }
+  ]
+}
+```
+
+- `contexts`: JSON 배열, 각 항목은 `text`(필수), `source`, `score`(권장) 포함
+- `text` 길이: 최대 2,000자로 제한
+- `score`: 코사인 유사도 기반 retrieval 점수 (소수점 4자리)
+
+## 4. 구현 세부사항
+
+### 4-1. 인덱스 초기화 (lifespan)
+
+FastAPI `lifespan` 이벤트로 서버 시작 시 인덱스를 로드합니다.
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global INDEX
+    INDEX = build_or_load_index()   # storage/ 로드 → 없으면 빌딩
+    yield
+```
+
+`storage/` 폴더가 존재하면 `load_index_from_storage()`로 빠르게 로드하고, 없으면 Wikipedia + `data/` 6종 포맷을 파싱해 `VectorStoreIndex`를 새로 구축합니다.
+
+### 4-2. /retrieve 처리 흐름
+
+```
+요청 JSON → RetrieveRequest 파싱 → INDEX.as_retriever(top_k) → node 목록
+  → 각 node에서 text(최대 2000자), source(file_name), score 추출
+  → {"contexts": [...]} 반환
+```
+
+### 4-3. Docker Compose 설정
+
+```yaml
+services:
+  rag:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage:/app/storage   # 인덱스 영속화
+      - ./data:/app/data
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
+
+`storage/`를 볼륨 마운트하여 컨테이너 재시작 시에도 인덱스를 재빌딩하지 않습니다.
+
+## 5. 실제 테스트 결과
+
+### /health 확인
+
+```
+GET https://isle-composite-jobs-substance.trycloudflare.com/health
+→ {"status":"ok","ready":true}
+```
+
+### /retrieve 확인 (질문: "Policy.pdf 내용은?", top_k=2)
+
+```json
+{
+  "contexts": [
+    {
+      "text": "제 2 조(적용범위)  연구비  지원기관 ...",
+      "source": "Policy.pdf",
+      "score": 0.5372
+    },
+    {
+      "text": "연구자의 연구수행 자율성 보장 및 지원 ...",
+      "source": "Policy.pdf",
+      "score": 0.5027
+    }
+  ]
+}
+```
+
+## 6. 실행 방법
+
+```bash
+# 1. Docker Compose로 RAG API 서버 시작 (포트 8000)
+docker compose up -d
+
+# 2. Windows PowerShell에서 Cloudflare Quick Tunnel 시작
+.\cloudflared.exe tunnel --url http://127.0.0.1:8000
+# → 터미널에 출력된 https://*.trycloudflare.com URL을 rag_endpoint.json에 기록
+
+# 3. public URL로 동작 확인
+curl.exe https://<tunnel-url>/health
+curl.exe -X POST https://<tunnel-url>/retrieve \
+  -H "Content-Type: application/json" \
+  -d "{\"question\":\"연구비 지침의 목적은?\",\"top_k\":3}"
+```
+
+## 7. URL 유지 규칙
+
+| 상황 | URL 변경 여부 |
+|------|:----------:|
+| Docker 컨테이너 재시작 | 유지 |
+| RAG 서버 코드 수정 후 재배포 | 유지 |
+| `cloudflared` 프로세스 종료 후 재실행 | **변경** |
+| PC 재부팅 후 재실행 | **변경** |
+
+평가 시간(11:20, 12:20)에는 `cloudflared` 프로세스를 종료하지 마세요. URL이 바뀌면 `rag_endpoint.json`을 수정하고 다시 commit/push 하세요.
+
+---
+
 # Mission 2 — RAG Top-10 실패 케이스 분석
 
 ## 실행 방법
@@ -148,3 +314,37 @@ python run_mission2.py
 | 실패 원인 | PDF 내 이미지는 텍스트 추출 불가 → 인덱스 부재 |
 | 검색 결과 | 무관한 대출 절차 텍스트 청크 반환 |
 | 개선 방안 | 멀티모달 모델 도입 또는 UI 요소 좌표를 메타데이터로 구조화 |
+
+---
+
+# Retrieval API Baseline Report
+
+## 1. 실행 방식
+
+- **RAG 서버 실행 방식**: Docker (`docker compose up -d`, port 8000)
+- **Cloudflare Quick Tunnel URL**: `https://isle-composite-jobs-substance.trycloudflare.com`
+- **사용한 데이터**: Mock (하드코딩된 고정 contexts — Policy.pdf·SRS.docx·Wikipedia 내용 기반)
+- **사용한 index/retriever**: Mock 서버 (실제 RAG 교체 전 endpoint 스펙 및 응답 형식 검증용)
+
+## 2. Public URL self-check
+
+- **/health 결과**: `{"status":"ok","ready":true}`
+- **/retrieve 테스트 질문**: `출장비 초과 시 어떤 승인이 필요한가?`
+- **/retrieve 반환 contexts 수**: 5개 (`top_k=5` 기준)
+
+## 3. Baseline 검색 결과
+
+| 질문 | 기대 정보 | 검색된 context에 포함 여부 | 실패 원인 |
+|---|---|---|---|
+| 출장비 초과 시 어떤 승인이 필요한가? | 출장비 한도·승인 절차 | ❌ 미포함 | Mock 서버 — 질문과 무관하게 고정 contexts 반환 |
+| 연구비 지침의 목적은 무엇인가? | 연구비 지침 목적 조항 | △ 부분 포함 | 고정 contexts에 Policy.pdf 조항 일부 포함되나 목적 조항과 일치하지 않음 |
+| 비기능 요구사항 항목은 몇 개인가? | SRS.docx 비기능 요구사항 목록 | △ 부분 포함 | 고정 contexts에 SRS.docx 비기능 요구사항 문장 1건 포함되나 전체 목록 아님 |
+
+> **비고**: 현재 Mock RAG로 동작 중. 질문이 달라도 동일한 contexts가 반환되는 구조이므로 검색 품질 평가 의미 없음. 실제 VectorStoreIndex 기반 RAG 교체 후 재평가 예정.
+
+## 4. 다음 개선 계획
+
+- **chunking**: `chunk_size=256, overlap=50` → 한국어 문서에 맞게 `chunk_size=512` 상향 검토
+- **metadata**: 파일명·조항 번호·페이지 번호 메타데이터 보강으로 필터링 검색 지원
+- **query rewrite**: 한국어 질문을 영어로 번역 후 검색하여 `all-MiniLM-L6-v2` 다국어 성능 개선
+- **reranker/top_k**: `similarity_top_k` 5→10으로 확대 후 reranker 적용해 최종 top_k 압축

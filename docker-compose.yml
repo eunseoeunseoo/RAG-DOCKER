@@ -1,0 +1,11 @@
+services:
+  rag:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    volumes:
+      - ./storage:/app/storage
+      - ./data:/app/data
+    command: uvicorn api_server:app --host 0.0.0.0 --port 8000
